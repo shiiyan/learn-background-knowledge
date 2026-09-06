@@ -1,6 +1,8 @@
-# Backend Knowledge Quick Reference
+# Backend Knowledge Deep-Dive Quick Reference
 
 A bilingual, Japanese-first reference curated for a backend technology deep-dive interview. It is not a transcription of any single question bank.
+
+Start with the [Backend Knowledge Fundamentals Quick Reference](./backend-knowledge-fundamentals-quick-reference.md), then use this sheet for technology internals and deeper follow-up questions.
 
 Every answer includes a concrete example. Every main question has two conversational follow-ups with the same answer, example, and keyword format.
 
