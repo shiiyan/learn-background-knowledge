@@ -366,31 +366,49 @@ Payment integrationは、user redirect、provider-side authorization、merchant 
 
 **具体例 — Amazon Pay Checkout v2 reference flow**
 
-The following is a verified reference flow. Before presenting it as personal experience, align object names and ordering with the API version actually used in the project.
+Before presenting this as personal experience, align the API version and payment intent with the project that was actually implemented.
+
+**Memory line:** `Create → buyer selects → Update → buyer approves → Complete → save/reconcile`
 
 ```text
-Actors: Buyer/Browser | Merchant Frontend | Merchant Backend | Amazon Pay
+Actors: Buyer/Browser | Merchant Backend | Amazon Pay
 
-1. Buyer -> Merchant Frontend: choose Amazon Pay at checkout
-2. Merchant Backend -> Frontend: signed Checkout Session payload
-3. Frontend -> Amazon Pay: render button and start Checkout Session
-4. Amazon Pay -> Buyer: hosted page for address/payment-instrument selection
-5. Amazon Pay -> Merchant review URL: redirect with checkoutSessionId
-6. Frontend -> Merchant Backend: load checkout review
-7. Merchant Backend -> Amazon Pay API: get/update Checkout Session
-   - final amount
-   - paymentIntent (for example, AuthorizeWithCapture)
-   - checkoutResultReturnUrl
-8. Merchant Backend -> Browser: redirect to amazonPayRedirectUrl
-9. Amazon Pay -> Buyer: process the selected payment
-10. Amazon Pay -> Merchant result URL: redirect with checkoutSessionId
-11. Merchant Backend -> Amazon Pay API: Complete Checkout Session
-    - same amount
-    - idempotency key on POST
-12. Amazon Pay -> Merchant Backend: ChargeId / ChargePermissionId or error
-13. Merchant Backend -> Internal DB: persist provider IDs and final state
-14. Merchant Backend -> Buyer: show confirmed, failed, or recovery-pending result
-15. Webhook/polling/reconciliation -> Backend: converge later state changes
+1. Create checkout
+   Buyer clicks Amazon Pay. The signed button payload starts a Checkout Session,
+   and Amazon Pay shows its hosted address/payment-selection page.
+   API equivalent: POST /v2/checkoutSessions
+
+2. Set the final payment
+   Amazon Pay returns checkoutSessionId to the merchant review page.
+   Backend sets amount, paymentIntent, and result URL, then receives
+   amazonPayRedirectUrl.
+   API: PATCH /v2/checkoutSessions/{checkoutSessionId}
+
+3. Buyer approves
+   Browser follows amazonPayRedirectUrl. Buyer confirms or completes MFA.
+   Amazon Pay redirects to checkoutResultReturnUrl with checkoutSessionId.
+
+4. Complete checkout
+   Backend verifies the amount and finalizes the payment.
+   API: POST /v2/checkoutSessions/{checkoutSessionId}/complete
+   Header: x-amz-pay-idempotency-key
+   Result: ChargeId, ChargePermissionId, or an error/pending state
+
+5. Save and converge
+   Backend stores provider IDs and the internal payment/order state.
+   Pending changes are resolved by IPN or polling:
+   GET /v2/charges/{chargeId}
+```
+
+For a Japan Checkout v2 integration using an environment-prefixed endpoint, the API base is:
+
+```text
+https://pay-api.amazon.jp/{environment}/v2
+
+POST  /checkoutSessions
+PATCH /checkoutSessions/{checkoutSessionId}
+POST  /checkoutSessions/{checkoutSessionId}/complete
+GET   /charges/{chargeId}
 ```
 
 The browser redirect proves that the buyer returned; the backend API result is what should finalize the internal payment decision. The provider documents `CheckoutSession`, `ChargePermission`, `Charge`, and `Refund` as distinct objects. Depending on `paymentIntent`, completion may authorize and capture immediately, authorize only, or only confirm permission.
