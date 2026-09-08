@@ -2,7 +2,7 @@
 
 An anonymized, Japanese-first preparation guide for a product-engineering/backend interview. Questions and answers are grouped by project so that architecture, difficult decisions, reliability, ownership, and outcomes form one coherent story.
 
-> **Accuracy rule:** `要確認` marks details that must be replaced with the real implementation before the interview. Never present a sensible design pattern as past experience unless it actually happened.
+> **Accuracy rule:** `確認済みの外部仕様` means the behavior is supported by official product documentation. `推奨設計案` means the design is a strong proposed answer, not proof of the historical implementation. Only describe a proposed design in the past tense after personal confirmation.
 
 ## Quick navigation
 
@@ -156,7 +156,15 @@ Workers -> Data platform: publish operational event
 
 The interview should use the real state names and ordering. This sequence only demonstrates the level of detail expected.
 
-**要確認:** 実際のservice数とdatabase ownership、決済の同期・非同期境界、transactional outboxの有無、物理アクセス更新の許容遅延。
+**推奨設計案 — service boundary、data ownership、sync/async**
+
+- **Ownership:** Reservation serviceだけがreservation tableをwriteする。Identity、payment、access、analyticsはそれぞれのteam/systemが自分のstoreを所有し、他serviceのtableへ直接writeしない。
+- **Synchronous path:** Authenticate user、availability/invariant check、temporary hold、user-interactive payment completion、final reservation decision。Userが次画面へ進むために必要な結果だけを含める。
+- **Asynchronous path:** Access provisioning、email/push、analytics、partner reporting。失敗してもreservation factを失わず、retry/reconciliationできる処理を置く。
+- **Outbox:** Reservation state変更と`outbox_event` insertを同じPostgreSQL transactionでcommitする。RelayがKafkaへpublishし、publish済みmarkまたはoffsetを進める。Consumerはduplicateを前提にidempotentにする。
+- **Access SLO proposal:** 通常はconfirmed eventの99.9%を60秒以内に反映し、予約開始時刻をhard deadlineとする。直前予約ではaccess確認を完了条件にするか、明示的な`ACCESS_PENDING`状態とsupport escalationを用意する。
+
+**本人確認:** 実際のservice数、outbox採用有無、payment/accessの本当の順序、許容遅延。Outboxを使っていない場合は、同じ目的を持つintegration-job tableやreconciliation processを説明する。
 
 ### Q1.3 — What made it technically difficult?
 
@@ -206,7 +214,27 @@ Local transaction、idempotent state transition、Saga/compensation、reconcilia
 
 `ReservationConfirmed` eventが二回配信されても、access workerは`reservation_id + access_window`をoperation keyとして扱います。一回目で権限作成済みなら二回目はno-opにします。逆に権限作成が失敗したら同じkeyでretryし、二重権限を作らずに収束させます。
 
-**要確認:** 実際のSaga方式、具体的なcompensation、idempotency keyの保存方法。
+**推奨設計案 — orchestrated Sagaとcompensation**
+
+User-facingでfinancial consequenceがあるため、workflow stateを一か所で追跡できるorchestrationを第一候補にする。
+
+```text
+CREATE_PENDING_RESERVATION
+  -> HOLD_RESOURCE
+  -> AUTHORIZE_OR_CAPTURE_PAYMENT
+  -> CONFIRM_RESERVATION
+  -> PROVISION_ACCESS (async, deadline-bound)
+
+Compensation:
+payment fails        -> release resource hold
+confirmation fails   -> void authorization or initiate refund
+access fails         -> retry -> alert -> manual grant/cancel policy
+user cancels         -> revoke access -> refund according to policy
+```
+
+`workflow_step(workflow_id, step_name, attempt_no, state, provider_reference, last_error)`を保存し、`UNIQUE(workflow_id, step_name)`またはoperation-specific keyでduplicate実行を防ぐ。External side effectには同じstable keyを渡し、compensation自体もidempotentにする。
+
+**本人確認:** 実際にはorchestrationかchoreographyか、resource holdの有無、void/refund rule、table/key名。
 
 ### Q1.6 — Which flows should be synchronous or asynchronous?
 
@@ -242,6 +270,20 @@ SLOは、対象endpoint、measurement window、除外条件、percentile、error
 
 API success rateが高くても、`CONFIRMED`予約のaccess provisioningが10分遅れれば利用者は入場できません。そのため、HTTP error rateに加え、`confirmed reservation with access_pending > threshold`の件数と最古ageをSLIとして監視します。
 
+**推奨SLO定義（実際のtargetへ合わせる）**
+
+| Concern | Proposed SLI definition | Example target |
+|---|---|---|
+| Request success | Eligible user requests that finish with the correct non-5xx outcome / all eligible requests | 99.99% or the documented historical target over 28/30 days |
+| Query latency | End-to-end latency measured at the API boundary for successful user-facing queries | p99 under 2 seconds; quote p99.99 only if dashboards and traffic volume support it |
+| Reservation correctness | Confirmed reservations with no unresolved payment/access contradiction | 99.99%+, with every contradiction reconciled |
+| Access readiness | Confirmed reservations provisioned before their access deadline | 99.9% within 60 seconds and 100% before start, if realistic |
+| Recovery | Unknown/integration-pending workflows resolved automatically within a bounded time | 99% within 15 minutes; page on oldest-age breach |
+
+Exclude health checks, load tests, and invalid client requests only through a documented rule; do not remove dependency failures merely because another team owns the dependency. Measure at the user-facing boundary, then break down internal causes separately.
+
+If quoting `99.999% request success`, explain that it is request-based: at one million eligible requests, the error budget is about ten failed requests. It is not automatically equivalent to seconds of downtime. If quoting p99.99, confirm there is enough traffic for a meaningful percentile and describe the measurement window.
+
 ### Q1.8 — What was your personal contribution and outcome?
 
 **要約**
@@ -258,7 +300,19 @@ API success rateが高くても、`CONFIRMED`予約のaccess provisioningが10�
 
 例えば新しいintegrationを追加するとき、私はdomain/API contractを設計し、Go codeとtestを実装し、Kubernetes/Istio設定とdashboardを追加し、release後のtraceまで確認しました。同時にteam memberのdesign reviewを行い、supportが障害状態を判断できるrunbookも整えました。
 
-**要確認:** Architecture migration自体の測定結果。CI/CDやalertの成果と混同しない。
+**推奨する効果測定 — architecture migration**
+
+Migrationの前後8–12週間など同程度のwindowで、次を比較する。
+
+- Change lead time: requirement readyからproductionまで
+- Deployment frequency and change-failure rate
+- Mean time to restore after integration failure
+- 一つのfeature変更で触るmodule/service数
+- Shared-tableへのdirect access数とcircular dependency数
+- Regression incident、rollback、support escalationの件数
+- Onboarding後に最初のproduction changeを出すまでの日数
+
+**Interview-safe wording:** 「CI/CD 30%短縮とalert noise削減は確認できた別の成果です。Architecture migration自体については、`[実測した指標]`で評価しました」と分ける。実測値がなければ「測るべきだった改善点」として話し、数字を作らない。
 
 ### Q1.9 — What would you change today?
 
@@ -347,7 +401,21 @@ The browser-redirect shape resembles an OAuth 2.0 Authorization Code flow: the u
 
 **Official references:** [Add the Amazon Pay button](https://developer.amazon.com/docs/amazon-pay-checkout/add-the-amazon-pay-button.html), [Set payment info](https://developer.amazon.com/docs/amazon-pay-checkout/v1-set-payment-info.html), [Verify and complete checkout](https://developer.amazon.com/docs/amazon-pay-checkout/verify-and-complete-checkout.html), [API object model](https://developer.amazon.com/docs/amazon-pay-api-v2/v1-introduction.html)
 
-**要確認:** 実際のauthorize/capture順序、webhook/polling、idempotency mechanism。
+**確認済みの外部仕様と推奨integration policy**
+
+- **Immediate payment:** 商品・予約をその場で確定し、取消riskが低い場合は`AuthorizeWithCapture`を選べる。Complete Checkout Sessionの成功responseから`ChargeId`と必要な`ChargePermissionId`を保存する。
+- **Deferred capture:** 在庫・出荷・最終予約確定を後で行う場合は`Authorize`を使い、確定後にcaptureする。長時間のauthorization保持、expiry、void/cancel policyを定義する。
+- **Permission only:** 将来の請求同意だけを得るuse caseでは`Confirm`を使い、`ChargePermissionId`を保存して後続Chargeを作る。
+- **Asynchronous state:** Pending authorization、遅いcapture、refundなどはIPNまたはGET API pollingでfinal stateを取得する。IPNは通知に含まれるobject IDを手がかりにGET APIを呼び、通知payloadだけでfinal stateを決めない。
+- **Polling fallback:** IPN遅延・欠損に備え、`PROCESSING/UNKNOWN` objectをperiodic pollingする。Official guideの一例はhourly pollingだが、checkout UXではbusiness deadlineに合わせて短いintervalとexponential backoffを使う。
+- **Idempotency:** Resourceを作るPOSTにはstable `x-amz-pay-idempotency-key`を設定する。同じoperationのretryではbodyとkeyを変えない。
+- **Retention:** Checkout Sessionと関連情報はprovider側で30日後に削除されるため、refund/reconciliation/auditに必要なCharge/Permission ID、merchant reference、amount、currency、state、timestampsをinternal storeへ保持する。
+
+**推奨する選択:** Physical goodsならauthorize at order confirmation / capture at shipment、即時提供するdigital serviceや確定予約ならauthorize-with-captureを第一候補にし、cancel/refund policyで最終決定する。
+
+**Official references:** [Verify and complete checkout](https://developer.amazon.com/docs/amazon-pay-checkout/verify-and-complete-checkout.html), [Asynchronous processing](https://developer.amazon.com/docs/amazon-pay-checkout/v1-asynchronous-processing.html), [Instant Payment Notifications](https://developer.amazon.com/docs/amazon-pay-checkout/v1-set-up-instant-payment-notifications.html)
+
+**本人確認:** 過去projectの`paymentIntent`、capture timing、IPN/polling、unknown-state recoveryが実際にどう実装されていたか。
 
 ### Q2.2 — What was the hardest technical problem?
 
@@ -381,7 +449,33 @@ Stable business identity、internal uniqueness、provider idempotency、state ch
 
 `order-123`のcapture operationに毎回同じidempotency keyを使います。Userがdouble-clickして二つのHTTP requestが来ても、internal unique constraintは一つのpayment attemptだけを作ります。ProviderへのPOSTも同じkeyなので、network retryが二回目のchargeを作りません。Amazon Pay APIではPOST requestに`x-amz-pay-idempotency-key`が必要です。
 
-**要確認:** 実際に使ったkey、unique constraint、provider機能。
+**確認済みの外部仕様と推奨internal constraint**
+
+Amazon Payはresource-creating requestのidempotencyを提供する。Official guidanceではUUID v4を推奨し、最大32文字、英数字・dash・underscoreを許可する。通常のhyphen付きUUID文字列は36文字なので、32文字のUUID v4 hex表現など、制限内の衝突しにくい値を生成する。同じkeyの最初のresponseは保存され、payloadを変えて再利用すると`DuplicateIdempotencyKey`になる。
+
+```text
+payment_attempt
+  id                    UUID PRIMARY KEY
+  order_id              UUID NOT NULL
+  attempt_no            INT NOT NULL
+  operation             AUTHORIZE | CAPTURE | REFUND
+  idempotency_key       VARCHAR(32) UNIQUE NOT NULL
+  provider_object_id    VARCHAR(...) UNIQUE NULL
+  amount_minor          BIGINT NOT NULL
+  currency              CHAR(3) NOT NULL
+  state                 ...
+  request_hash          CHAR(64) NOT NULL
+  UNIQUE(order_id, attempt_no, operation)
+```
+
+- Same logical operation: reuse the same key and identical request body.
+- New intentional attempt after a final decline: allocate a new `attempt_no` and key.
+- Concurrent request: insert the attempt first; the unique constraint elects one caller as owner.
+- Retry after timeout: read the stored attempt and reuse its key; never generate a fresh key inside retry code.
+
+**Official reference:** [Amazon Pay idempotency](https://developer.amazon.com/docs/amazon-pay-api-v2/idempotency.html)
+
+**本人確認:** 実際のkey format、table/constraint、request-hashの有無。
 
 ### Q2.4 — What if the database commits but the provider times out?
 
@@ -415,7 +509,28 @@ Internal ledgerとprovider recordを定期比較し、差分を分類して自�
 
 前日のcaptured transactionsについて、`merchant_reference_id`、provider charge ID、amount、currency、statusをjoinします。Providerは`CAPTURED`だがinternalは`PROCESSING`ならinternal stateを安全に修正します。Amount mismatchやprovider側だけに存在するchargeは自動変更せず、金額影響付きのcaseとして担当者へ送ります。
 
-**要確認:** 実際のreconciliation頻度、matching key、manual operation、data retention。
+**推奨設計案 — reconciliation**
+
+| Layer | Frequency | Purpose |
+|---|---:|---|
+| Hot recovery | Every 1–5 minutes | Resolve checkout attempts in `PROCESSING/UNKNOWN` before user/support impact grows |
+| Daily transaction reconciliation | Daily after provider reporting closes | Compare Charge/Refund state, amount, currency, and merchant reference |
+| Settlement reconciliation | Per settlement period | Compare captured/refunded totals, fees, adjustments, and actual disbursement |
+| Long-tail audit | Weekly/monthly | Detect old unresolved items, chargebacks, and manual corrections |
+
+Matching priority:
+
+1. Provider `ChargeId` or `RefundId`
+2. Stored merchant reference / order ID
+3. Amount + currency + bounded timestamp only as investigation support, never as the sole automatic-match key
+
+Differences become typed cases: `PROVIDER_ONLY`, `INTERNAL_ONLY`, `STATUS_MISMATCH`, `AMOUNT_MISMATCH`, `DUPLICATE`, `STALE_PENDING`. Safe status updates may be automated; money-moving corrections require approval, audit log, and an idempotent command. Store report ID, source row, before/after states, operator, reason, and provider response.
+
+Retention must follow legal/accounting/privacy policy. At minimum, keep identifiers and financial audit fields long enough for refund, dispute, chargeback, settlement, and statutory windows; delete unnecessary buyer profile data earlier. Provider-side 30-day availability is not a substitute for internal retention.
+
+**Official references:** [Settlement report fields](https://developer.amazon.com/docs/amazon-pay-reports/settlement-reports.html), [Report use for reconciliation](https://developer.amazon.com/docs/amazon-pay-checkout/set-up-reports.html)
+
+**本人確認:** Actual reporting schedule, legal retention period, approval workflow, and automatic-repair scope.
 
 ### Q2.6 — How do provider differences affect the design?
 
@@ -449,7 +564,38 @@ Payment flowではdata minimization、signed server-to-server calls、least priv
 
 Browserからprovider secretを送らず、merchant backendがprivate keyでAPI requestを署名します。Internal DBにはcard numberではなくprovider token/referenceと必要なstatusだけを保存します。Manual refundを行う場合は、operator、reason、before/after state、provider responseをaudit logへ残します。
 
-**要確認:** 実際のPCI scope、tokenization、key management、成果指標。
+**確認済みの外部仕様と推奨security design**
+
+**PCI scope and tokenization**
+
+- In the hosted checkout flow, the buyer selects the payment instrument on the provider-hosted page. The merchant backend should not receive or store PAN/CVV.
+- Store provider references (`CheckoutSessionId` temporarily, `ChargePermissionId`, `ChargeId`, `RefundId`), merchant reference, amount, currency, timestamps, and normalized state—not raw card data.
+- For a separate direct-card integration, use the PSP's hosted fields or client-side tokenization so raw PAN does not traverse the application server.
+- Do not claim a specific PCI SAQ level from architecture alone. Confirm it with the security/compliance owner, acquirer, or QSA because scripts, hosting model, operational access, and other payment methods affect scope.
+
+**Key management**
+
+- Keep the asymmetric private key only in a managed secret store or HSM/KMS-backed secret path; never ship it to the browser, repository, container image, log, or analytics system.
+- Give the payment workload a least-privilege runtime identity; restrict human read access and audit every secret access.
+- Load the key in memory only for request signing; redact signatures, buyer details, and provider payloads from logs.
+- Rotate by creating/uploading a new key, deploying support for the new Public Key ID, verifying traffic, then revoking the old key. Alert on unexpected signature failures and stale keys.
+- Separate sandbox and production configuration and access even when a provider technically permits credential reuse.
+
+Amazon Pay documents asymmetric request signing, secure storage of the private key, and a key-rotation strategy. It does not publish the merchant's final PCI classification.
+
+**Recommended success metrics**
+
+- Checkout completion and authorization/capture success by payment method
+- Duplicate charge count: target zero
+- `UNKNOWN/PENDING` count, oldest age, and percentage resolved automatically
+- Internal/provider mismatch count and financial amount at risk
+- P95/P99 provider latency and timeout rate
+- Refund completion time and failure rate
+- Payment-related support contacts and mean time to resolution
+
+**Official references:** [Hosted buyer experience](https://developer.amazon.com/docs/amazon-pay-checkout/introduction.html), [Signing requests](https://developer.amazon.com/docs/amazon-pay-api-v2/v1-signing-requests.html), [Key creation and secure storage](https://developer.amazon.com/docs/amazon-pay-api-v2/manually-generating-key-pairs.html), [API security and rotation guidance](https://developer.amazon.com/docs/amazon-pay-api-v2/introduction.html)
+
+**本人確認:** Direct-card integration architecture, actual secret store/KMS, rotation cadence, PCI assessment, and real metric values.
 
 ---
 
@@ -508,7 +654,21 @@ Near real timeは曖昧な表現ではなく、source eventからconsumer-visibl
 
 仮に「99%が5分以内」というSLOなら、eventの`occurred_at`とserving tableの`available_at`の差を計測します。P99が8分へ悪化したら、broker lag、stream processing time、table publicationのどこで3分増えたか分解して調査します。
 
-**要確認:** 実際のfreshness targetとpercentile。数字が確定するまでは「準リアルタイム」とだけ説明する。
+**推奨設計案 — freshness SLO**
+
+Consumerごとにfreshnessを分ける。すべてを最も厳しいSLOへ合わせない。
+
+| Consumer | Proposed SLO | Failure action |
+|---|---|---|
+| Operational reservation/payment dashboard | 99% within 5 minutes; no item older than 15 minutes | Page on sustained breach; show data-last-updated time |
+| Product analytics | 99% within 15 minutes | Ticket/alert; preserve correctness rather than drop late data |
+| Authorized partner report | Complete by contracted delivery deadline | Block publication if completeness/reconciliation check fails |
+
+Measure `available_at - source_committed_at`, not job runtime alone. Publish p50/p95/p99, max age, input lag, processing lag, and publication lag. A dashboard must display its last successful refresh so consumers do not treat stale data as current.
+
+**Interview-safe wording:** If these were not historical targets, say「私ならconsumer impactからこのようにSLOを設定します」rather than「5分SLOでした」。
+
+**本人確認:** Actual consumer deadlines, event volume, and historical p99.
 
 ### Q3.3 — How do you handle duplicates and late data?
 
@@ -526,7 +686,25 @@ Orderingが重要なentityではversionまたはsequenceを比較し、古いupd
 
 同じ`payment-captured` eventがconsumer restart後に二回届いても、`event_id`でdeduplicateし、売上を二重加算しません。またversion 12の`CANCELED`更新後に遅れてversion 11の`CONFIRMED`が届いても、merge条件を`incoming.version > current.version`にして巻き戻しを防ぎます。
 
-**要確認:** 実際にDelta Lake MERGE、checkpoint、watermark、sequenceを使ったか。
+**推奨設計案 — Delta/Structured Streaming implementation**
+
+```text
+Bronze: append raw event + event_id + event_time + ingest_time + source offset
+Silver: validate schema, quarantine invalid rows, deduplicate by event_id
+Gold: MERGE latest entity version and build business aggregates
+```
+
+- Use an explicit durable checkpoint location per query. It tracks offsets, committed micro-batches, and state needed after restart.
+- Use `foreachBatch` + `MERGE` for upsert, and make the MERGE idempotent because a restarted stream can apply a micro-batch again.
+- Deduplicate by stable `event_id`; use entity `version/sequence` in the MERGE condition so older events cannot overwrite newer state.
+- Use a watermark to bound state for late-data handling, but do not use it as permission to silently discard financially important events. Send beyond-watermark records to correction/reconciliation flow when completeness matters.
+- Monitor backlog bytes/files, batch duration, input rows, processed rows, dropped/quarantined rows, watermark delay, and checkpoint failure.
+
+Databricks documents checkpoint recovery, stateful deduplication, idempotent `MERGE` in `foreachBatch`, and the need to handle schema changes carefully.
+
+**Official references:** [Structured Streaming checkpoints](https://docs.databricks.com/aws/en/structured-streaming/checkpoints), [Delta streaming reads and writes](https://docs.databricks.com/aws/en/structured-streaming/delta-lake), [Schema evolution](https://docs.databricks.com/aws/en/data-engineering/schema-evolution)
+
+**本人確認:** Actual Bronze/Silver/Gold layout, checkpoint storage, MERGE keys, watermark, and late-event policy.
 
 ### Q3.4 — How do you verify correctness?
 
@@ -558,7 +736,18 @@ Replay可能にするには、raw inputをdurableかつimmutableに近い形で�
 
 Tax fieldのmapping bugが8月1日から3日まで存在した場合、raw eventsは変更せず、transform v2をその三日分へ実行します。新しいpartition/tableへ書き、row countとamount aggregateを検証してからconsumer viewを切り替えます。Streaming jobが同じpartitionへ同時writeしないよう範囲を隔離します。
 
-**要確認:** Raw retention、checkpoint reset、backfill isolation、consumer切替方法。
+**推奨設計案 — retention, checkpoint, and backfill**
+
+- **Raw retention:** Choose a replay window from correction/chargeback/reporting needs and privacy policy. A practical starting point is 90 days online plus cheaper archival if policy permits, but do not state this as the historical setting without evidence.
+- **Checkpoint:** Never delete/reset a production checkpoint for an ordinary redeploy. Resume from it when query/state schema is compatible. If an incompatible source, stateful operator, or state schema change requires a new checkpoint, start a controlled new query and define its starting version/time explicitly.
+- **Backfill isolation:** Run backfill with a separate job identity, checkpoint, compute quota, and output staging table. Rate-limit it so it cannot starve the live stream.
+- **Idempotent output:** MERGE by business key + version or write a new immutable table version. Record `backfill_run_id`, code version, source range, row counts, and validation result.
+- **Cutover:** Compare source/old target/new target counts and aggregates, then atomically switch a view/table alias. Keep the old target for a rollback window.
+- **Concurrency:** Freeze overlapping partitions briefly or use version-aware MERGE so live events win correctly while backfill runs.
+
+**Concrete recovery example:** A mapping bug affected August 1–3. Deploy transform v2, replay immutable raw records for that range into `gold_v2`, reconcile counts/amounts, pause only publication, switch the consumer view, and retain `gold_v1` until the rollback window expires.
+
+**本人確認:** Actual retention, whether checkpoint reset was ever required, table/view cutover mechanism, and backfill resource isolation.
 
 ### Q3.6 — How do you evolve schemas?
 
@@ -602,7 +791,22 @@ Streaming、batch、replay、analytics、governanceをまとめて必要とし�
 
 運用teamは未解決の予約・決済差分をdaily dashboardで確認し、product teamは予約category別利用傾向を分析し、許可されたpartnerには自分の対象dataだけをreportとして提供できます。同じbusiness definitionを共有することで、部署ごとの数字のずれを減らします。
 
-**要確認:** Dashboard利用者、report作成時間、freshness改善、manual work削減などの実測値。
+**推奨するoutcome evidence**
+
+Collect one baseline and one after-value for each relevant consumer:
+
+- Operations: time to find unresolved reservation/payment mismatch; manual spreadsheet steps; incident detection delay
+- Product: time from question to available dataset; number of reusable curated metrics; conflicting metric definitions
+- Partner reporting: preparation hours, late reports, correction count, unauthorized-access incidents
+- Platform: p99 freshness, completeness percentage, failed job/replay frequency, cost per processed event/GB
+
+**Detailed answer template:**
+
+> Before the pipeline, `[consumer]` needed `[manual process/time]` and data was delayed by `[baseline]`. After release, `[dataset/dashboard]` refreshed at `[actual p99]`, reduced `[manual work/error]` by `[actual result]`, and enabled `[decision or operational action]`. I owned `[specific design/code/operation]`.
+
+If no numerical baseline exists, use auditable evidence such as eliminating a named manual handoff, supporting a new partner report, or reducing investigation steps. Do not invent percentages.
+
+**本人確認:** Real users, baseline, after-value, and one decision made from the data.
 
 ---
 
@@ -675,7 +879,31 @@ Messageにはstable job identityと対象entityを持たせ、処理前にcurren
 
 `UPDATE shipments SET state='REQUESTED' WHERE id=? AND state='READY'`のようなconditional updateを使います。Affected rowが0なら、別workerが処理済みかinvalid stateなので再実行しません。External APIには`shipment_id`由来のidempotency keyを渡します。
 
-**要確認:** 実際のdeduplication table、conditional update、visibility timeout、DLQ運用。
+**確認済みのqueue behaviorと推奨worker design**
+
+Standard SQS is at-least-once: the same message can be delivered more than once. Visibility timeout only hides a received message temporarily; if the worker does not delete it before timeout, it becomes visible again. Therefore, correctness belongs in the consumer.
+
+```text
+processed_job
+  job_id          VARCHAR PRIMARY KEY
+  entity_id       VARCHAR NOT NULL
+  operation       VARCHAR NOT NULL
+  state           PROCESSING | SUCCEEDED | FAILED
+  owner_token     UUID
+  result_ref      VARCHAR NULL
+  updated_at      TIMESTAMP
+```
+
+- Insert/claim `job_id` with a unique constraint, or use a conditional business-state update. `SUCCEEDED` means duplicate delivery can return success without repeating the side effect.
+- Set visibility timeout above normal processing time—for example p99 processing time plus a safety margin. For variable long work, heartbeat with `ChangeMessageVisibility`; do not set an extremely long timeout that delays recovery.
+- Delete the message only after durable business state is committed.
+- Configure bounded retry and a DLQ. A proposed starting policy is `maxReceiveCount=5`, then tune from failure data.
+- Alarm on oldest-message age, visible/in-flight count, DLQ depth, receive count, processing latency, and success/failure by operation.
+- Redrive from DLQ only after fixing the cause; preserve original message ID and attach a redrive audit record.
+
+**Official references:** [SQS at-least-once delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues-at-least-once-delivery.html), [Visibility timeout and DLQ guidance](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)
+
+**本人確認:** Actual queue type, timeout, max receive count, DLQ alarm/redrive, and deduplication implementation.
 
 ### Q4.4 — How did you control load and fairness?
 
@@ -707,7 +935,19 @@ Old/new processorを比較し、tenantまたはorder type単位で段階移行�
 
 最初にinternal test tenantだけを`processor=v2`へrouteし、処理件数、error、duration、final shipment stateをold batchと比較します。次にsmall tenantの5%、25%、100%へ広げます。Rollbackはflagをv1へ戻しますが、v2 queueに残るmessageをdrainまたはinvalidateする手順も必要です。
 
-**要確認:** 実際のrollout unit、comparison method、rollback design。
+**推奨設計案 — staged rollout and rollback**
+
+1. **Characterization:** Capture old batch behavior with production-derived test cases.
+2. **Shadow:** Generate v2 decisions but suppress external side effects; compare target entity, payload, and expected final state.
+3. **Internal tenant:** Route only test/internal tenant traffic.
+4. **Canary:** Deterministic tenant hash or allowlist: 1% → 5% → 25% → 50% → 100%. Keep a tenant entirely on one processor to avoid split ownership.
+5. **Gates:** At each stage compare completion count, duplicate side effects, p95/p99 duration, DB query/load, queue age, DLQ count, and support issues.
+6. **Rollback:** Stop new v2 enqueue, identify and drain/cancel already queued v2 jobs, then switch routing to v1. Do not let v1 and v2 own the same shipment simultaneously.
+7. **Finalize:** After a stable observation window, remove v1 scheduling and retain reconciliation for late differences.
+
+Use a `processing_owner/version` column or routing ledger so ownership is durable rather than only an in-memory feature flag.
+
+**本人確認:** Actual rollout percentages/unit, whether shadow execution was possible, queue-drain procedure, and rollback window.
 
 ### Q4.6 — Outcome and lesson
 
@@ -791,7 +1031,30 @@ Lag、failure count、source/index countを監視し、定期reindexまたは差
 
 Job version 8の`published` event後に、遅れてversion 7の`draft` eventが届いても、indexerはdocument versionを比較してversion 7を無視します。Indexingが一時間停止した場合はoutbox offsetから再開し、必要ならDB snapshotから新indexを作ってaliasを切り替えます。
 
-**要確認:** 実際の同期方式。この回答は標準設計であり、過去実装の事実として未確定。
+**推奨設計案 — search synchronization and repair**
+
+```text
+PostgreSQL transaction:
+  update job(version=8) + insert outbox(job_id, version=8)
+        |
+        v
+Outbox relay -> event broker -> indexer -> OpenSearch jobs_v3
+                                         -> alias: jobs_read
+```
+
+- PostgreSQL remains the source of truth. Avoid an application-level DB + index dual write because either side can succeed alone.
+- Insert an outbox row in the same transaction as the domain change. Publish at least once; indexer upsert/delete must be idempotent.
+- Use domain entity ID as document ID and database version as external version. Ignore an event whose version is older than the indexed document.
+- Measure outbox age, consumer lag, indexing failure, source/index count by partition, and sampled field checksum.
+- Keep a repair job that reads changed DB rows or compares versions and reindexes missing/stale documents.
+- For mapping/analyzer changes, build `jobs_v4`, backfill it, validate search quality/counts, then atomically move stable alias `jobs_read` from v3 to v4. Keep v3 for rollback.
+- Search results are candidates. Recheck critical mutable business conditions—published status, authorization, availability—against the source of truth before a write action.
+
+OpenSearch supports external versioning and aliases that can switch between indexes without application downtime.
+
+**Official references:** [Index document external versioning](https://docs.opensearch.org/latest/api-reference/document-apis/index-document/), [Index aliases](https://docs.opensearch.org/latest/im-plugin/index-alias/), [Reindex API](https://docs.opensearch.org/latest/api-reference/document-apis/reindex/)
+
+**本人確認:** Actual source of truth, event/outbox/CDC mechanism, document version, repair job, and alias use. Call it CQRS only if command/query models were intentionally separated beyond merely adding a search index.
 
 ### Q5.4 — Why move from NoSQL to SQL?
 
@@ -835,7 +1098,26 @@ Read pathは一部trafficから段階的に切り替え、差分やerror rateを
 
 User ID 1から100,000までcheckpoint付きでbackfillします。その間のprofile updateはchange eventまたはtemporary dual writeでSQL側にも適用します。Readの1%をSQLへ送り、response fieldとerrorをshadow compareします。Mismatchがthreshold以下になってからtrafficを増やし、旧storeをread-onlyで保持してrollback可能にします。
 
-**要確認:** 実際にdual write、CDC、application event、shadow readのどれを使ったか。
+**推奨設計案 — zero-downtime NoSQL-to-SQL migration**
+
+Prefer a durable change log/CDC over uncoordinated dual writes. If CDC is unavailable, use an application outbox; use direct dual write only with explicit failure recording and repair.
+
+```text
+Phase 1  Create SQL schema, constraints, mapping/version table
+Phase 2  Start change capture from NoSQL -> durable migration log
+Phase 3  Backfill snapshot in key ranges with checkpoints
+Phase 4  Replay changes after each range's snapshot position
+Phase 5  Shadow-read and compare normalized responses
+Phase 6  Canary SQL reads: internal -> 1% -> 10% -> 50% -> 100%
+Phase 7  Make SQL authoritative; keep old store read-only for rollback
+Phase 8  Reconcile, close rollback window, delete data by retention policy
+```
+
+Validation must cover record counts plus business invariants: unique email/member keys, required relations, nullability, status mapping, orphan records, and representative API response equality. Record each migrated key range with `snapshot_position`, `last_change_position`, counts, checksum, and status so retries are idempotent.
+
+During canary, route one user/entity consistently to one read source. Writes continue through the authoritative old path plus durable change capture until cutover. If mismatch exceeds threshold, stop canary and rebuild affected ranges; do not reverse-copy uncertain data automatically.
+
+**本人確認:** Actual source database capability, capture mechanism, backfill key/range, comparison tooling, cutover percentages, and rollback duration.
 
 ### Q5.6 — What was the outcome?
 
@@ -1016,18 +1298,49 @@ Partnerが同じcampaign correctionを三回送っても、`partner_id + externa
 | Reliability/SLO | Reservation/access platform | Recommendation scenario |
 | Product impact | Marketplace MVP | Reservation/data pipeline |
 | ML or ranking integration | Recommendation scenario | Data pipeline experience |
-| Failure or lesson learned | `要確認: choose one real incident` | Architecture evolution |
+| Failure or lesson learned | Reservation/access recovery incident — use the proposed skeleton below only after adapting it to a real event | Architecture evolution |
 
-## Facts to confirm before rehearsal
+### Proposed incident-story skeleton
 
-- [ ] Exact reservation-system topology and service boundaries
-- [ ] Real synchronous/asynchronous boundaries for payment and access control
-- [ ] Actual Saga, compensation, idempotency, outbox, and reconciliation mechanisms
-- [ ] One concrete incident: symptom, impact, diagnosis, action, result, prevention
-- [ ] Exact SLO definitions and measurements
-- [ ] Payment authorize/capture, callback, unknown-outcome, and reconciliation flow
-- [ ] Data-pipeline freshness, volume, deduplication, replay, and backfill mechanisms
-- [ ] Order-worker deduplication, DLQ, rollout, and rollback mechanics
-- [ ] Search-index synchronization mechanism and whether CQRS was intentional
-- [ ] Exact NoSQL-to-SQL cutover sequence and validation evidence
-- [ ] One rejected alternative and one lesson for each of Projects 1–5
+Do not present this as historical fact until it matches a real incident.
+
+| Stage | Detailed example to adapt |
+|---|---|
+| Situation | Access-system latency increased; reservation events accumulated and some confirmed users approached their start time without provisioned access |
+| Detection | User-facing API remained mostly healthy, but `oldest access_pending age` and queue lag crossed the operational deadline |
+| Immediate action | Stopped aggressive retries, opened the circuit/bounded concurrency, prioritized reservations nearest to start time, and prepared manual access for imminent users |
+| Diagnosis | Traces showed downstream timeout; retry amplification consumed worker/connection capacity and delayed healthy work |
+| Fix | Added exponential backoff with jitter, retry budget, per-dependency concurrency limit, idempotent provisioning, and a deadline-aware priority/recovery queue |
+| Prevention | Added `confirmed-but-access-pending` SLI, oldest-age alert, runbook, dependency dashboard, and a game-day/load test for slow downstream behavior |
+| Outcome | Replace with real affected-user count, recovery time, backlog drain time, and recurrence result |
+
+## Proposed alternatives and lessons by project
+
+| Project | Main alternative rejected | Why the proposed choice is stronger | Lesson to state |
+|---|---|---|---|
+| Reservation/access | Continue shared-DB transaction scripts or perform a big-bang microservice rewrite | Incremental domain separation preserves delivery and rollback while clarifying ownership | Distributed consistency means detectable and recoverable state, not pretending all services share one transaction |
+| Payment integration | Treat provider call as one synchronous request and mark timeout as failure | Persistent attempts, idempotency, unknown state, callbacks/polling, and reconciliation prevent duplicate financial side effects | A payment integration is a long-lived state machine, not an API wrapper |
+| Data pipeline | Build one point-to-point export per dashboard/consumer | A governed raw-to-curated pipeline supports replay, shared definitions, quality checks, and multiple consumers | Fresh but wrong data is still an incident; freshness and correctness need separate SLIs |
+| Order processing | Increase the size/frequency of the database-scanning batch | Fine-grained queued work gives fairness, bounded concurrency, isolated retries, and visible backlog | Async processing moves complexity into delivery, idempotency, and operation; it does not remove it |
+| Search/data migration | Keep all search in SQL and all relational workflow in NoSQL, or switch stores in one event | Specialized read model plus staged migration matches changing access/consistency needs without downtime | Technology choice should change when product access patterns change; no database is universally better |
+
+## Personal confirmation ledger
+
+The architecture questions now have proposed detailed answers. The remaining work is historical verification—information that external documentation and general engineering knowledge cannot establish.
+
+| Personal fact to verify | Proposed answer location | Minimum evidence before using past tense |
+|---|---|---|
+| Exact reservation topology and ownership | Q1.2 | Real service names/count, database owner, integration contracts |
+| Sync/async payment and access sequence | Q1.2 and Q1.6 | Real state diagram or code/API flow |
+| Saga, compensation, outbox, and idempotency | Q1.5 | One real workflow ID, step record, compensation, and retry mechanism |
+| Production incident | Proposed incident-story skeleton | Actual date/context, impact, action you took, measured recovery and prevention |
+| Request and business SLOs | Q1.7 | Dashboard/query definition, window, exclusions, percentile, real target |
+| Payment intent and callback/recovery | Q2.1–Q2.5 | Actual API version, intent, provider object IDs, IPN/polling, reconciliation job |
+| PCI and secret management | Q2.7 | Security assessment, tokenization boundary, secret store, rotation process |
+| Pipeline freshness/dedup/replay | Q3.2–Q3.5 | Job/query configuration, checkpoint, merge key, retention, actual SLO |
+| Pipeline impact | Q3.8 | Named consumer, before/after process, one measured outcome |
+| Queue worker and rollout | Q4.3–Q4.5 | Queue type, visibility timeout, DLQ/redrive, idempotency record, rollout unit |
+| Search synchronization/CQRS | Q5.3 | Actual source, event mechanism, versioning, repair/reindex process; intentional CQRS decision if claimed |
+| NoSQL-to-SQL cutover | Q5.5 | Actual backfill/change-capture/read-switch/rollback sequence |
+
+Until a row is verified, introduce it with「この要件なら私はこう設計します」or「改善案としては」rather than「私は実装しました」。
